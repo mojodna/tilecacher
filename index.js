@@ -2,14 +2,18 @@
 const url = require("url");
 const util = require("util");
 
+const Bottleneck = require("bottleneck");
 const lockingCache = require("locking-cache");
 const tilelive = require("tilelive-streaming")(
   require("tilelive-cache")(require("@mapbox/tilelive"))
-  // require("@mapbox/tilelive")
 );
 
 // load and initialize available tilelive modules
-require("tilelive-modules/loader")(tilelive);
+require("tilelive-modules/loader")(tilelive, {
+  "tilelive-http": {
+    retry: true
+  }
+});
 
 // handle unhandled rejections
 process.on("unhandledRejection", err => {
@@ -20,10 +24,11 @@ process.on("unhandledRejection", err => {
 const load = util.promisify(tilelive.load);
 const locker = lockingCache();
 
-const fallback = (primary, cache, uri) => {
+const fallback = (primary, cache) => {
   const getTile = locker((z, x, y, lock) => {
-    return lock(uri + ":" + [z, x, y].join("/"), unlock => {
+    return lock(primary.sourceURI + ":" + [z, x, y].join("/"), unlock => {
       return cache.getTile(z, x, y, (err, data, headers) => {
+        // TODO apply cache invalidation
         if (err) {
           return primary.getTile(z, x, y, unlock);
         }
@@ -37,6 +42,25 @@ const fallback = (primary, cache, uri) => {
     ...primary,
     getTile
   };
+};
+
+const rateLimit = source => {
+  if (source.rateLimited) {
+    return source;
+  }
+
+  const limiter = new Bottleneck(16, 100);
+
+  const getTile = (z, x, y, callback) => {
+    console.log([z, x, y].join("/"))
+    return limiter.submit(source.getTile, z, x, y, callback);
+  };
+
+  return {
+    ...source,
+    getTile,
+    rateLimited: true
+  }
 }
 
 const copy = async (from, to, options) => {
@@ -48,9 +72,12 @@ const copy = async (from, to, options) => {
       id: from
     }
   });
+  // TODO register something that periodically invalidates data (using same cache invalidation rules from ^^) if one hasn't already been registered
   const cacheWriter = cache.createWriteStream();
 
-  const source = fallback(actualSource, cache, from);
+  // limit concurrency at the source level
+  const rateLimitedSource = rateLimit(actualSource);
+  const source = fallback(rateLimitedSource, cache);
 
   const rs = source.createReadStream(options);
   const ws = sink.createWriteStream();
@@ -90,6 +117,8 @@ const main = async () => {
       ),
     ]);
 
+    // TODO copy MBTiles from a temporary location when complete
+    // TODO notify a web hook when complete
     console.log("done.");
   } catch (err) {
     console.warn(err);
